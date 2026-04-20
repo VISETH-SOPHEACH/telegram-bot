@@ -15,7 +15,7 @@ from telegram.ext import (
     filters,
 )
 
-from downloader import DownloadError, download_media
+from downloader import DownloadError, download_media, prepare_video_for_delivery
 
 
 load_dotenv()
@@ -176,6 +176,8 @@ async def handle_format_choice(
     file_path: Path | None = None
     try:
         file_path = await asyncio.to_thread(download_media, url, format_choice)
+        if format_choice == "mp4":
+            file_path = await asyncio.to_thread(prepare_video_for_delivery, file_path)
         file_size = file_path.stat().st_size
         if file_size > MAX_UPLOAD_SIZE_BYTES:
             raise DownloadError(
