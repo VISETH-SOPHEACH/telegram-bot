@@ -1,7 +1,9 @@
 import math
-import json
+import os
+import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import yt_dlp
@@ -9,165 +11,185 @@ import yt_dlp
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
-DOWNLOAD_DIR.mkdir(exist_ok=True)
-TELEGRAM_UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024
-TARGET_UPLOAD_BYTES = 48 * 1024 * 1024
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MIN_MP3_BITRATE_KBPS = 32
-DEFAULT_AUDIO_BITRATE_KBPS = 96
+DEFAULT_AUDIO_BITRATE_KBPS = 128
+FFMPEG_VIDEO_SCALE_FILTER = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+_FFMPEG_PATH: str | None = None
 
 
 class DownloadError(Exception):
     pass
 
 
-def _run_ffmpeg(command: list[str], error_message: str) -> None:
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
-        details = (result.stderr or result.stdout or "").strip()
-        if details:
-            raise DownloadError(f"{error_message} ffmpeg said: {details[-300:]}")
-        raise DownloadError(error_message)
+def _read_upload_limit_bytes() -> int:
+    raw_value = os.getenv("TELEGRAM_MAX_UPLOAD_MB", "50").strip()
+    try:
+        upload_limit_mb = float(raw_value)
+    except ValueError:
+        upload_limit_mb = 50.0
+
+    if upload_limit_mb <= 0:
+        upload_limit_mb = 50.0
+
+    return int(upload_limit_mb * 1024 * 1024)
 
 
-def _get_ffmpeg_path() -> str:
+TELEGRAM_UPLOAD_LIMIT_BYTES = _read_upload_limit_bytes()
+TARGET_UPLOAD_BYTES = max(1, TELEGRAM_UPLOAD_LIMIT_BYTES - (2 * 1024 * 1024))
+
+
+def _get_ffmpeg_path(required: bool = True) -> str | None:
+    global _FFMPEG_PATH
+
+    if _FFMPEG_PATH and Path(_FFMPEG_PATH).exists():
+        return _FFMPEG_PATH
+
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
+        try:
+            import imageio_ffmpeg
+        except ImportError:
+            ffmpeg_path = None
+        else:
+            try:
+                ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception:
+                ffmpeg_path = None
+
+    if not ffmpeg_path and required:
         raise DownloadError(
-            "ffmpeg is required to process large files. Install ffmpeg and make sure it is on PATH."
+            "ffmpeg is required for high-quality downloads. Install the dependencies from requirements.txt and try again."
         )
+
+    _FFMPEG_PATH = ffmpeg_path
     return ffmpeg_path
 
 
-def _replace_file(original: Path, replacement: Path) -> Path:
-    if original.exists():
-        original.unlink()
-    replacement.replace(original)
-    return original
+def _safe_float(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def _normalize_mp4_for_ios(file_path: Path) -> Path:
-    ffmpeg_path = shutil.which("ffmpeg")
+def _replace_file(
+    original: Path, replacement: Path, *, keep_original_name: bool = True
+) -> Path:
+    original.unlink(missing_ok=True)
+    if keep_original_name:
+        replacement.replace(original)
+        return original
+    return replacement
+
+
+def _replace_file_with_new_path(
+    original: Path, replacement: Path, destination: Path
+) -> Path:
+    original.unlink(missing_ok=True)
+    replacement.replace(destination)
+    return destination
+
+
+def _run_command(command: list[str], error_message: str) -> None:
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode == 0:
+        return
+
+    details = (result.stderr or result.stdout or "").strip()
+    if details:
+        raise DownloadError(f"{error_message} ffmpeg said: {details[-400:]}")
+    raise DownloadError(error_message)
+
+
+def _probe_media(file_path: Path) -> dict[str, object] | None:
+    ffmpeg_path = _get_ffmpeg_path(required=False)
     if not ffmpeg_path:
-        return file_path
-
-    normalized_path = file_path.with_name(f"{file_path.stem}.ios.mp4")
-    command = [
-        ffmpeg_path,
-        "-y",
-        "-i",
-        str(file_path),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "fast",
-        "-profile:v",
-        "high",
-        "-level",
-        "4.0",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        str(normalized_path),
-    ]
-
-    _run_ffmpeg(command, "ffmpeg could not normalize the video for iPhone playback.")
-    return _replace_file(file_path, normalized_path)
-
-
-def _probe_media_streams(file_path: Path) -> dict | None:
-    ffprobe_path = shutil.which("ffprobe")
-    if not ffprobe_path:
         return None
 
     result = subprocess.run(
-        [
-            ffprobe_path,
-            "-v",
-            "error",
-            "-show_entries",
-            "format=format_name",
-            "-show_streams",
-            "-of",
-            "json",
-            str(file_path),
-        ],
+        [ffmpeg_path, "-hide_banner", "-i", str(file_path)],
         capture_output=True,
         text=True,
     )
-    if result.returncode != 0:
+
+    output = "\n".join(part for part in (result.stderr, result.stdout) if part).strip()
+    if not output:
         return None
 
-    try:
-        return json.loads(result.stdout or "{}")
-    except json.JSONDecodeError:
-        return None
+    format_name = ""
+    duration_seconds: float | None = None
+    video_codec = ""
+    pixel_format = ""
+    audio_codec = ""
+
+    for line in output.splitlines():
+        stripped = line.strip()
+
+        if stripped.startswith("Input #0, "):
+            format_name = stripped[len("Input #0, "):].rsplit(", from", 1)[0].strip()
+
+        if "Duration:" in stripped and duration_seconds is None:
+            match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stripped)
+            if match:
+                hours = int(match.group(1))
+                minutes = int(match.group(2))
+                seconds = float(match.group(3))
+                duration_seconds = hours * 3600 + minutes * 60 + seconds
+
+        if " Video: " in stripped and not video_codec:
+            codec_match = re.search(r"Video:\s*([^\s,(]+)", stripped)
+            pixel_match = re.search(
+                r"Video:.*?,\s*([a-zA-Z0-9_]+)(?:\(|,|\s)",
+                stripped,
+            )
+            if codec_match:
+                video_codec = codec_match.group(1).lower()
+            if pixel_match:
+                pixel_format = pixel_match.group(1).lower()
+
+        if " Audio: " in stripped and not audio_codec:
+            codec_match = re.search(r"Audio:\s*([^\s,(]+)", stripped)
+            if codec_match:
+                audio_codec = codec_match.group(1).lower()
+
+    return {
+        "format_name": format_name.lower(),
+        "duration_seconds": duration_seconds,
+        "video_codec": video_codec,
+        "pixel_format": pixel_format,
+        "audio_codec": audio_codec,
+    }
 
 
-def _needs_compatibility_normalization(file_path: Path) -> bool:
-    probe_data = _probe_media_streams(file_path)
+def _is_mp4_container(format_name: str) -> bool:
+    if not format_name:
+        return False
+    return any(part in {"mov", "mp4", "m4a"} for part in format_name.split(","))
+
+
+def _is_mp4_compatible_video(probe_data: dict[str, object] | None) -> bool:
     if not probe_data:
-        return file_path.suffix.lower() != ".mp4"
-
-    format_name = ((probe_data.get("format") or {}).get("format_name") or "").lower()
-    if "mp4" not in format_name and "mov" not in format_name:
-        return True
-
-    video_stream = None
-    audio_stream = None
-    for stream in probe_data.get("streams") or []:
-        codec_type = stream.get("codec_type")
-        if codec_type == "video" and video_stream is None:
-            video_stream = stream
-        elif codec_type == "audio" and audio_stream is None:
-            audio_stream = stream
-
-    if not video_stream:
         return False
 
-    video_codec = (video_stream.get("codec_name") or "").lower()
-    pixel_format = (video_stream.get("pix_fmt") or "").lower()
-    if video_codec != "h264" or pixel_format not in {"yuv420p", ""}:
-        return True
+    video_codec = str(probe_data.get("video_codec") or "").lower()
+    pixel_format = str(probe_data.get("pixel_format") or "").lower()
+    audio_codec = str(probe_data.get("audio_codec") or "").lower()
 
-    if audio_stream:
-        audio_codec = (audio_stream.get("codec_name") or "").lower()
-        if audio_codec != "aac":
-            return True
-
-    return False
+    if video_codec != "h264":
+        return False
+    if pixel_format not in {"", "yuv420p"}:
+        return False
+    if audio_codec and audio_codec != "aac":
+        return False
+    return True
 
 
 def _get_media_duration_seconds(file_path: Path) -> float | None:
-    ffprobe_path = shutil.which("ffprobe")
-    if not ffprobe_path:
-        return None
-
-    result = subprocess.run(
-        [
-            ffprobe_path,
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(file_path),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return None
-
-    try:
-        return float((result.stdout or "").strip())
-    except ValueError:
-        return None
+    probe_data = _probe_media(file_path)
+    return _safe_float((probe_data or {}).get("duration_seconds"))
 
 
 def _compress_mp3_to_fit(file_path: Path, duration_seconds: float) -> Path:
@@ -178,10 +200,10 @@ def _compress_mp3_to_fit(file_path: Path, duration_seconds: float) -> Path:
     target_bitrate_kbps = math.floor(
         (TARGET_UPLOAD_BYTES * 8) / duration_seconds / 1000
     )
-    target_bitrate_kbps = min(192, target_bitrate_kbps)
+    target_bitrate_kbps = min(320, target_bitrate_kbps)
     if target_bitrate_kbps < MIN_MP3_BITRATE_KBPS:
         raise DownloadError(
-            "This audio is too long to fit within Telegram's current 50 MB bot upload limit."
+            "This audio is too long to fit within Telegram's upload limit."
         )
 
     compressed_path = file_path.with_name(f"{file_path.stem}.tg.mp3")
@@ -198,7 +220,7 @@ def _compress_mp3_to_fit(file_path: Path, duration_seconds: float) -> Path:
         str(compressed_path),
     ]
 
-    _run_ffmpeg(command, "ffmpeg could not compress the MP3 for Telegram delivery.")
+    _run_command(command, "ffmpeg could not compress the MP3 for Telegram delivery.")
 
     if compressed_path.stat().st_size > TELEGRAM_UPLOAD_LIMIT_BYTES:
         compressed_path.unlink(missing_ok=True)
@@ -217,12 +239,12 @@ def _compress_mp4_to_fit(file_path: Path, duration_seconds: float) -> Path:
     total_bitrate_kbps = math.floor(
         (TARGET_UPLOAD_BYTES * 8) / duration_seconds / 1000
     )
-    audio_bitrate_kbps = min(DEFAULT_AUDIO_BITRATE_KBPS, max(48, total_bitrate_kbps // 5))
+    audio_bitrate_kbps = min(DEFAULT_AUDIO_BITRATE_KBPS, max(64, total_bitrate_kbps // 5))
     video_bitrate_kbps = total_bitrate_kbps - audio_bitrate_kbps - 32
 
     if video_bitrate_kbps < 120:
         raise DownloadError(
-            "This video is too long to fit within Telegram's current 50 MB bot upload limit."
+            "This video is too long to fit within Telegram's upload limit."
         )
 
     compressed_path = file_path.with_name(f"{file_path.stem}.tg.mp4")
@@ -235,6 +257,10 @@ def _compress_mp4_to_fit(file_path: Path, duration_seconds: float) -> Path:
         "libx264",
         "-preset",
         "veryfast",
+        "-vf",
+        FFMPEG_VIDEO_SCALE_FILTER,
+        "-pix_fmt",
+        "yuv420p",
         "-b:v",
         f"{video_bitrate_kbps}k",
         "-maxrate",
@@ -250,7 +276,7 @@ def _compress_mp4_to_fit(file_path: Path, duration_seconds: float) -> Path:
         str(compressed_path),
     ]
 
-    _run_ffmpeg(command, "ffmpeg could not compress the video for Telegram delivery.")
+    _run_command(command, "ffmpeg could not compress the video for Telegram delivery.")
 
     if compressed_path.stat().st_size > TELEGRAM_UPLOAD_LIMIT_BYTES:
         compressed_path.unlink(missing_ok=True)
@@ -267,74 +293,126 @@ def _ensure_upload_size(
     if file_path.stat().st_size <= TELEGRAM_UPLOAD_LIMIT_BYTES:
         return file_path
 
-    duration_seconds = duration_seconds or 0
+    duration_seconds = duration_seconds or _get_media_duration_seconds(file_path) or 0
     if format_choice == "mp3":
         return _compress_mp3_to_fit(file_path, duration_seconds)
     if format_choice == "mp4":
         return _compress_mp4_to_fit(file_path, duration_seconds)
-
     return file_path
 
 
-def prepare_video_for_delivery(file_path: Path) -> Path:
+def _remux_to_mp4(file_path: Path) -> Path:
+    ffmpeg_path = _get_ffmpeg_path()
+    remuxed_path = file_path.with_name(f"{file_path.stem}.remux.mp4")
+    final_path = file_path.with_suffix(".mp4")
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-i",
+        str(file_path),
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(remuxed_path),
+    ]
+
+    _run_command(command, "ffmpeg could not remux the video to MP4.")
+    return _replace_file_with_new_path(file_path, remuxed_path, final_path)
+
+
+def _transcode_to_mp4(file_path: Path) -> Path:
+    ffmpeg_path = _get_ffmpeg_path()
+    transcoded_path = file_path.with_name(f"{file_path.stem}.normalized.mp4")
+    final_path = file_path.with_suffix(".mp4")
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-i",
+        str(file_path),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "18",
+        "-vf",
+        FFMPEG_VIDEO_SCALE_FILTER,
+        "-profile:v",
+        "high",
+        "-level",
+        "4.0",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
+        str(transcoded_path),
+    ]
+
+    _run_command(command, "ffmpeg could not normalize the video for delivery.")
+    return _replace_file_with_new_path(file_path, transcoded_path, final_path)
+
+
+def prepare_video_for_delivery(
+    file_path: Path, duration_seconds: float | None = None
+) -> Path:
+    probe_data = _probe_media(file_path)
     normalized_file = file_path
-    if _needs_compatibility_normalization(file_path):
-        normalized_file = _normalize_mp4_for_ios(file_path)
 
-    return _ensure_upload_size(
-        normalized_file,
-        "mp4",
-        _get_media_duration_seconds(normalized_file),
-    )
+    if _is_mp4_compatible_video(probe_data):
+        if file_path.suffix.lower() != ".mp4" or not _is_mp4_container(
+            str((probe_data or {}).get("format_name") or "")
+        ):
+            try:
+                normalized_file = _remux_to_mp4(file_path)
+            except DownloadError:
+                normalized_file = _transcode_to_mp4(file_path)
+    elif file_path.suffix.lower() != ".mp4" or probe_data:
+        normalized_file = _transcode_to_mp4(file_path)
+
+    return _ensure_upload_size(normalized_file, "mp4", duration_seconds)
 
 
-def _build_options(format_choice: str) -> dict:
-    output_template = str(DOWNLOAD_DIR / "%(extractor)s_%(id)s_%(title).50s.%(ext)s")
+def _build_options(format_choice: str, download_dir: Path) -> dict[str, object]:
+    output_template = str(download_dir / "%(extractor)s_%(id)s_%(title).80s.%(ext)s")
+    ffmpeg_path = _get_ffmpeg_path(required=format_choice in {"mp3", "mp4"})
     base_options = {
         "outtmpl": output_template,
         "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
         "noplaylist": True,
         "windowsfilenames": True,
         "restrictfilenames": True,
+        "overwrites": True,
         "retries": 10,
         "fragment_retries": 10,
         "extractor_retries": 5,
         "file_access_retries": 3,
         "socket_timeout": 30,
         "geo_bypass": True,
+        "concurrent_fragment_downloads": 4,
+        "ffmpeg_location": ffmpeg_path,
     }
 
     if format_choice == "mp3":
-        ffmpeg_path = _get_ffmpeg_path()
-
         return base_options | {
             "format": "bestaudio/best",
-            "ffmpeg_location": ffmpeg_path,
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
-                "preferredquality": "192",
+                "preferredquality": "320",
             }],
         }
 
     if format_choice == "mp4":
-        ffmpeg_path = shutil.which("ffmpeg")
-        if ffmpeg_path:
-            return base_options | {
-                "format": (
-                    "best[ext=mp4][vcodec!=none][acodec!=none]/"
-                    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-                    "bestvideo+bestaudio/"
-                    "best"
-                ),
-                "ffmpeg_location": ffmpeg_path,
-                "merge_output_format": "mp4",
-                "format_sort": ["hasvid", "res", "fps", "hdr", "vcodec", "acodec"],
-            }
-
         return base_options | {
-            "format": "best[ext=mp4][vcodec!=none][acodec!=none]/best[ext=mp4]/best",
-            "format_sort": ["hasvid", "res", "fps", "hdr", "vcodec", "acodec"],
+            "format": "bv*+ba/b",
+            "merge_output_format": "mkv",
         }
 
     raise DownloadError("Only mp3 and mp4 are supported.")
@@ -346,15 +424,22 @@ def _find_downloaded_file(downloaded_file: Path, format_choice: str) -> Path:
     if format_choice == "mp3":
         candidates.append(downloaded_file.with_suffix(".mp3"))
     elif format_choice == "mp4":
-        candidates.append(downloaded_file.with_suffix(".mp4"))
+        candidates.extend([
+            downloaded_file.with_suffix(".mkv"),
+            downloaded_file.with_suffix(".mp4"),
+            downloaded_file.with_suffix(".webm"),
+        ])
 
     for candidate in candidates:
-        if candidate.exists():
+        if candidate.exists() and candidate.is_file():
             return candidate
 
-    pattern = f"{downloaded_file.stem}*"
     matches = sorted(
-        (path for path in downloaded_file.parent.glob(pattern) if path.is_file()),
+        (
+            path
+            for path in downloaded_file.parent.iterdir()
+            if path.is_file() and path.suffix not in {".part", ".ytdl"}
+        ),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -364,48 +449,71 @@ def _find_downloaded_file(downloaded_file: Path, format_choice: str) -> Path:
     raise DownloadError("The media was downloaded, but the final file could not be found.")
 
 
-def download_media(url: str, format_choice: str) -> Path:
+def _resolve_downloaded_path(
+    info: dict[str, object], downloaded_file: Path, format_choice: str
+) -> Path:
+    requested_downloads = info.get("requested_downloads") or []
+    if isinstance(requested_downloads, list):
+        for download in requested_downloads:
+            if not isinstance(download, dict):
+                continue
+            filepath = download.get("filepath")
+            if filepath and Path(filepath).exists():
+                return Path(filepath)
+
+    return _find_downloaded_file(downloaded_file, format_choice)
+
+
+def cleanup_download_artifacts(file_path: Path) -> None:
+    resolved_download_root = DOWNLOAD_DIR.resolve()
     try:
-        with yt_dlp.YoutubeDL(_build_options(format_choice)) as ydl:
+        resolved_file = file_path.resolve()
+    except FileNotFoundError:
+        resolved_file = file_path
+
+    if resolved_file.exists():
+        resolved_file.unlink(missing_ok=True)
+
+    try:
+        resolved_parent = resolved_file.parent.resolve()
+    except FileNotFoundError:
+        resolved_parent = resolved_file.parent
+
+    if (
+        resolved_parent.parent == resolved_download_root
+        and resolved_parent.name.startswith("job_")
+    ):
+        shutil.rmtree(resolved_parent, ignore_errors=True)
+
+
+def download_media(url: str, format_choice: str) -> Path:
+    job_dir = Path(tempfile.mkdtemp(prefix="job_", dir=DOWNLOAD_DIR))
+
+    try:
+        with yt_dlp.YoutubeDL(_build_options(format_choice, job_dir)) as ydl:
             info = ydl.extract_info(url, download=True)
-            downloaded_file = ydl.prepare_filename(info)
-            duration_seconds = info.get("duration")
+            downloaded_file = Path(ydl.prepare_filename(info))
+            duration_seconds = _safe_float(info.get("duration"))
+            media_path = _resolve_downloaded_path(info, downloaded_file, format_choice)
 
             if format_choice == "mp3":
-                requested = info.get("requested_downloads") or []
-                if requested:
-                    filepath = requested[0].get("filepath")
-                    if filepath:
-                        return _ensure_upload_size(
-                            Path(filepath), format_choice, duration_seconds
-                        )
-                return _ensure_upload_size(
-                    _find_downloaded_file(Path(downloaded_file), format_choice),
-                    format_choice,
-                    duration_seconds,
-                )
+                return _ensure_upload_size(media_path, format_choice, duration_seconds)
 
-            if info.get("requested_downloads"):
-                filepath = info["requested_downloads"][0].get("filepath")
-                if filepath:
-                    return _ensure_upload_size(
-                        Path(filepath), format_choice, duration_seconds
-                    )
-
-            return _ensure_upload_size(
-                _find_downloaded_file(Path(downloaded_file), format_choice),
-                format_choice,
-                duration_seconds,
-            )
+            return prepare_video_for_delivery(media_path, duration_seconds)
     except yt_dlp.utils.DownloadError as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
         raise DownloadError(str(exc)) from exc
     except DownloadError:
+        shutil.rmtree(job_dir, ignore_errors=True)
         raise
     except FileNotFoundError as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
         raise DownloadError(
             "A required tool was not found while processing this media."
         ) from exc
     except OSError as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
         raise DownloadError(f"File processing failed: {exc}") from exc
     except Exception as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
         raise DownloadError(f"Unexpected downloader error: {exc}") from exc

@@ -2,45 +2,53 @@
 
 This bot accepts supported video links, lets the user choose `MP3` or `MP4`, downloads the media with `yt-dlp`, and uploads the result back to Telegram.
 
-## What was fixed
+## What is fixed
 
-- Cleaned up broken bot messages and button labels.
-- Removed the global per-user URL store and switched to `context.user_data`.
-- Added startup validation for a missing `BOT_TOKEN`.
-- Moved downloads to a worker thread so the bot stays responsive.
-- Added clearer download and upload error handling.
-- Added automatic compression for oversized downloads when possible, while still respecting Telegram's current bot upload limit.
-- Added video normalization so delivered MP4 files are more compatible with iOS, Android, Windows, macOS, and Linux Telegram clients.
-- Added Windows launcher files so the bot can run in the background and auto-start at login.
-- Added a simple `run_bot.sh` launcher for macOS and Linux.
+- Rebuilt the broken `bot.py` runtime flow and Telegram handlers.
+- Added safer per-request state so multiple links from the same user do not overwrite each other.
+- Moved each download into its own temporary job folder to avoid collisions between concurrent downloads.
+- Upgraded the video pipeline to download the highest available quality first, then remux or transcode only when needed for Telegram-friendly MP4 delivery.
+- Added cross-platform `ffmpeg` fallback through `imageio-ffmpeg`, so high-quality merging and conversion work on Windows, macOS, and Linux without relying only on a system `ffmpeg`.
+- Kept automatic compression for files that exceed Telegram's upload limit.
+- Updated launcher and setup scripts to prefer a local `.venv` on every OS.
 
-## Files for background startup
+## Supported sites
 
-- `run_bot.ps1`: starts the bot with `py -3` or `python`
-- `run_bot.sh`: starts the bot with `python3` or `python` on macOS/Linux
-- `start_bot_hidden.vbs`: launches the PowerShell script without a visible console
-- `install_autostart.ps1`: creates a Windows Scheduled Task that starts the bot when you log in
+- YouTube
+- Facebook
+- Instagram
+- TikTok
 
-## Required setup
+## Requirements
 
-1. Install Python 3 if it is not already installed.
-2. Install the Python packages:
-
-```powershell
-pip install -r requirements.txt
-```
-
-3. Install `ffmpeg` and make sure it is on your `PATH`.
-   MP3 conversion, video normalization, and large-file compression will not work without it.
-4. Put your bot token in `.env` as:
+- Python 3.10 or newer is recommended.
+- A Telegram bot token in `.env`:
 
 ```env
-BOT_TOKEN=your_new_bot_token_here
+BOT_TOKEN=your_bot_token_here
 ```
 
-## Important security note
+Optional:
 
-The current `.env` file contains a real bot token. You should rotate that token in BotFather now, then update `.env` with the new token.
+```env
+TELEGRAM_MAX_UPLOAD_MB=50
+```
+
+Change `TELEGRAM_MAX_UPLOAD_MB` only if your Telegram bot setup supports a different upload limit.
+
+## Setup
+
+Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup_bot.ps1
+```
+
+macOS or Linux:
+
+```sh
+sh ./setup_bot.sh
+```
 
 ## Run the bot
 
@@ -56,22 +64,27 @@ macOS or Linux:
 sh ./run_bot.sh
 ```
 
-## Start automatically without opening a terminal on Windows
+## Windows background startup
 
-Run this once in PowerShell:
+Install the login-time auto-start task:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install_autostart.ps1
 ```
 
-After that, Windows will start the bot in the background each time you log in.
-
-## Manual test
-
-Before relying on auto-start, test once with:
+Restart the background bot:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\run_bot.ps1
+powershell -ExecutionPolicy Bypass -File .\restart_bot.ps1
 ```
 
-Then open Telegram and send `/start` to your bot.
+## Download behavior
+
+- `MP3`: downloads the best available audio, then converts it to MP3.
+- `MP4`: downloads the best available video and audio, then makes the result Telegram-friendly.
+- If the finished file is too large, the bot compresses it just enough to fit the configured Telegram upload limit.
+
+## Notes
+
+- The `downloads/` folder is used for temporary work files and should not be committed.
+- If `.env` contains a real production token, rotate it in BotFather if that token was ever shared.

@@ -1,11 +1,13 @@
 import asyncio
 import logging
 import os
+import re
+import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import TelegramError
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -15,21 +17,33 @@ from telegram.ext import (
     filters,
 )
 
-from downloader import DownloadError, download_media, prepare_video_for_delivery
+from downloader import (
+    DownloadError,
+    TELEGRAM_UPLOAD_LIMIT_BYTES,
+    cleanup_download_artifacts,
+    download_media,
+)
 
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-MAX_UPLOAD_SIZE_BYTES = 50 * 1024 * 1024
-SUPPORTED_DOMAINS = (
+PENDING_REQUESTS_KEY = "pending_requests"
+SUPPORTED_DOMAINS = {
     "youtube.com",
     "youtu.be",
     "facebook.com",
     "fb.watch",
     "instagram.com",
     "tiktok.com",
-)
+}
+URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
+BOT_API_TIMEOUTS = {
+    "read_timeout": 180,
+    "write_timeout": 180,
+    "connect_timeout": 30,
+    "pool_timeout": 30,
+}
 
 
 logging.basicConfig(
@@ -37,64 +51,54 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 LOGGER = logging.getLogger(__name__)
-SELECTED_URL_KEY = "selected_url"
-DOWNLOAD_IN_PROGRESS_KEY = "download_in_progress"
 
 
-def build_format_keyboard() -> InlineKeyboardMarkup:
+def _upload_limit_label() -> str:
+    upload_limit_mb = TELEGRAM_UPLOAD_LIMIT_BYTES / (1024 * 1024)
+    if upload_limit_mb.is_integer():
+        return f"{int(upload_limit_mb)} MB"
+    return f"{upload_limit_mb:.1f} MB"
+
+
+def _build_format_keyboard(request_id: str) -> InlineKeyboardMarkup:
     keyboard = [[
-        InlineKeyboardButton("MP3 Audio", callback_data="mp3"),
-        InlineKeyboardButton("MP4 Video", callback_data="mp4"),
+        InlineKeyboardButton("MP3 Audio", callback_data=f"download:{request_id}:mp3"),
+        InlineKeyboardButton("MP4 Video", callback_data=f"download:{request_id}:mp4"),
     ]]
     return InlineKeyboardMarkup(keyboard)
 
 
-async def send_media_file(
-    update: Update,
+def _extract_supported_url(text: str) -> str | None:
+    for raw_candidate in URL_PATTERN.findall(text):
+        candidate = raw_candidate.strip("()[]{}<>\"'.,")
+        if _is_supported_url(candidate):
+            return candidate
+    return None
+
+
+def _is_supported_url(url: str) -> bool:
+    parsed_url = urlparse(url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        return False
+
+    hostname = parsed_url.netloc.lower().split("@")[-1].split(":")[0]
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+
+    return any(
+        hostname == domain or hostname.endswith(f".{domain}")
+        for domain in SUPPORTED_DOMAINS
+    )
+
+
+def _get_pending_requests(
     context: ContextTypes.DEFAULT_TYPE,
-    file_path: Path,
-    format_choice: str,
-) -> None:
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id is None:
-        raise DownloadError("Could not determine the chat for the upload.")
-
-    with file_path.open("rb") as media_file:
-        if format_choice == "mp3":
-            try:
-                await context.bot.send_audio(
-                    chat_id=chat_id,
-                    audio=media_file,
-                    caption="Your audio is ready.",
-                )
-                return
-            except TelegramError as exc:
-                LOGGER.warning("send_audio failed, falling back to document: %s", exc)
-                media_file.seek(0)
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=media_file,
-                    filename=file_path.name,
-                    caption="Your audio is ready.",
-                )
-                return
-
-        try:
-            await context.bot.send_video(
-                chat_id=chat_id,
-                video=media_file,
-                caption="Your video is ready.",
-                supports_streaming=True,
-            )
-        except TelegramError as exc:
-            LOGGER.warning("send_video failed, falling back to document: %s", exc)
-            media_file.seek(0)
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=media_file,
-                filename=file_path.name,
-                caption="Your video is ready.",
-            )
+) -> dict[str, str]:
+    pending_requests = context.user_data.setdefault(PENDING_REQUESTS_KEY, {})
+    if not isinstance(pending_requests, dict):
+        pending_requests = {}
+        context.user_data[PENDING_REQUESTS_KEY] = pending_requests
+    return pending_requests
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -102,23 +106,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.message.reply_text(
-        "Hello! I am Viseth \n Video Downloader Bot.\n\n"
+        "Hello! I am Viseth Video Downloader Bot.\n\n"
         "Supported platforms:\n"
         "- YouTube\n"
         "- Facebook\n"
         "- Instagram\n"
         "- TikTok\n\n"
-        "Send me a supported video link, then choose MP3 or MP4.\n",
-        # "Large files will be compressed when possible to fit Telegram bot limits.",
+        "Send a supported link and choose MP3 or MP4.\n"
+        "The bot downloads the highest available quality first, then compresses only if Telegram's upload limit requires it.\n"
+        f"Current upload limit: {_upload_limit_label()}.",
+        **BOT_API_TIMEOUTS,
     )
 
 
-async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
         return
 
     await update.message.reply_text(
-        f"Your Telegram user ID is: {update.effective_user.id}"
+        "Send a YouTube, Facebook, Instagram, or TikTok link.\n"
+        "I will ask whether you want MP3 audio or MP4 video, then return the best result that fits Telegram.",
+        **BOT_API_TIMEOUTS,
     )
 
 
@@ -126,17 +134,26 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not update.message or not update.message.text:
         return
 
-    url = update.message.text.strip()
-    if not any(domain in url for domain in SUPPORTED_DOMAINS):
+    url = _extract_supported_url(update.message.text)
+    if not url:
         await update.message.reply_text(
-            "Please send a valid YouTube, Facebook, Instagram, or TikTok link."
+            "Please send a valid YouTube, Facebook, Instagram, or TikTok link.",
+            **BOT_API_TIMEOUTS,
         )
         return
 
-    context.user_data[SELECTED_URL_KEY] = url
+    request_id = uuid.uuid4().hex[:8]
+    pending_requests = _get_pending_requests(context)
+    pending_requests[request_id] = url
+
+    while len(pending_requests) > 10:
+        oldest_request_id = next(iter(pending_requests))
+        pending_requests.pop(oldest_request_id, None)
+
     await update.message.reply_text(
         "Link received. Choose your download format:",
-        reply_markup=build_format_keyboard(),
+        reply_markup=_build_format_keyboard(request_id),
+        **BOT_API_TIMEOUTS,
     )
 
 
@@ -144,81 +161,73 @@ async def handle_format_choice(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     query = update.callback_query
-    if not query or not query.message:
+    if not query or not query.message or not query.data:
         return
 
     await query.answer()
 
-    format_choice = query.data or ""
-    url = context.user_data.get(SELECTED_URL_KEY)
+    try:
+        _, request_id, format_choice = query.data.split(":", 2)
+    except ValueError:
+        await query.edit_message_text("Unsupported format selection.")
+        return
+
     if format_choice not in {"mp3", "mp4"}:
         await query.edit_message_text("Unsupported format selection.")
         return
 
+    pending_requests = _get_pending_requests(context)
+    url = pending_requests.pop(request_id, None)
     if not url:
-        await query.edit_message_text("Session expired. Please send the link again.")
+        await query.edit_message_text("This request expired. Please send the link again.")
         return
-
-    if context.user_data.get(DOWNLOAD_IN_PROGRESS_KEY):
-        await query.answer(
-            "A download is already running for this chat. Please wait for it to finish.",
-            show_alert=False,
-        )
-        return
-
-    context.user_data[DOWNLOAD_IN_PROGRESS_KEY] = True
 
     await query.edit_message_text(
-        f"Downloading {format_choice.upper()} now with the best quality available. "
-        "Large files may take longer if compression is needed..."
+        f"Downloading {format_choice.upper()} in the highest available quality. Please wait..."
     )
 
     file_path: Path | None = None
+    chat_id = query.message.chat.id
     try:
         file_path = await asyncio.to_thread(download_media, url, format_choice)
-        if format_choice == "mp4":
-            file_path = await asyncio.to_thread(prepare_video_for_delivery, file_path)
-        file_size = file_path.stat().st_size
-        if file_size > MAX_UPLOAD_SIZE_BYTES:
+        if file_path.stat().st_size > TELEGRAM_UPLOAD_LIMIT_BYTES:
             raise DownloadError(
-                "The file is still larger than Telegram's current 50 MB bot upload limit."
+                "The downloaded file is larger than Telegram's upload limit."
             )
 
-        await send_media_file(update, context, file_path, format_choice)
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text="You can use the same link again. Choose another format if you want:",
-            reply_markup=build_format_keyboard(),
-        )
+        with file_path.open("rb") as media_file:
+            if format_choice == "mp3":
+                await context.bot.send_audio(
+                    chat_id=chat_id,
+                    audio=media_file,
+                    caption="Your audio is ready.",
+                    **BOT_API_TIMEOUTS,
+                )
+            else:
+                await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=media_file,
+                    caption="Your video is ready.",
+                    supports_streaming=True,
+                    **BOT_API_TIMEOUTS,
+                )
     except DownloadError as exc:
         LOGGER.warning("Download failed: %s", exc)
         await context.bot.send_message(
-            chat_id=query.message.chat_id,
+            chat_id=chat_id,
             text=f"Download failed: {exc}",
+            **BOT_API_TIMEOUTS,
         )
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text="You can still try the same link again with another format:",
-            reply_markup=build_format_keyboard(),
-        )
-    except Exception:  # pragma: no cover - safety net for runtime issues
+    except Exception:  # pragma: no cover - runtime safety net
         LOGGER.exception("Unexpected error while processing download")
         await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text="Something went wrong while processing that link. The link is still saved, so please try again in a moment.",
-        )
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text="The link is still saved. You can retry with MP3 or MP4:",
-            reply_markup=build_format_keyboard(),
+            chat_id=chat_id,
+            text="Something went wrong while processing that link. Please try again.",
+            **BOT_API_TIMEOUTS,
         )
     finally:
-        context.user_data.pop(DOWNLOAD_IN_PROGRESS_KEY, None)
-        if file_path and file_path.exists():
-            try:
-                file_path.unlink()
-            except OSError:
-                LOGGER.warning("Could not remove temporary file: %s", file_path)
+        if file_path:
+            cleanup_download_artifacts(file_path)
 
 
 def validate_environment() -> None:
@@ -229,14 +238,19 @@ def validate_environment() -> None:
 def main() -> None:
     validate_environment()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("myid", my_id))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    app.add_handler(CallbackQueryHandler(handle_format_choice))
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(
+        CallbackQueryHandler(
+            handle_format_choice,
+            pattern=r"^download:[0-9a-f]{8}:(mp3|mp4)$",
+        )
+    )
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
-    LOGGER.info("Bot is starting")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    LOGGER.info("Bot is running")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
