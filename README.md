@@ -8,6 +8,7 @@ This bot accepts supported video links, lets the user choose `MP3` or `MP4`, dow
 - Added safer per-request state so multiple links from the same user do not overwrite each other.
 - Moved each download into its own temporary job folder to avoid collisions between concurrent downloads.
 - Upgraded the video pipeline to download the highest available quality first, then remux or transcode only when needed for Telegram-friendly MP4 delivery.
+- Added metadata-aware download planning so the bot estimates format sizes before downloading and prefers the best candidate that is most likely to fit Telegram cleanly.
 - Added cross-platform `ffmpeg` fallback through `imageio-ffmpeg`, so high-quality merging and conversion work on Windows, macOS, and Linux without relying only on a system `ffmpeg`.
 - Kept automatic compression for files that exceed Telegram's upload limit.
 - Updated launcher and setup scripts to prefer a local `.venv` on every OS.
@@ -103,7 +104,8 @@ powershell -ExecutionPolicy Bypass -File .\restart_bot.ps1
 ## Download behavior
 
 - `MP3`: downloads the best available audio, then converts it to MP3.
-- `MP4`: downloads the best available video and audio, then makes the result Telegram-friendly.
+- `MP3`: now targets a bitrate based on the media duration and Telegram budget before post-download compression is needed.
+- `MP4`: now inspects available formats first, prefers high-quality options that are likely to fit, and falls back to remux/transcode only when required for Telegram-friendly delivery.
 - If the finished file is too large, the bot compresses it just enough to fit the configured Telegram upload limit.
 
 ## Notes

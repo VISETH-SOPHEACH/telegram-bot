@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import yt_dlp
@@ -23,6 +24,15 @@ _FFMPEG_PATH: str | None = None
 
 class DownloadError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class DownloadPlan:
+    format_selector: str
+    merge_output_format: str | None = None
+    preferred_audio_quality_kbps: int | None = None
+    expected_size_bytes: int | None = None
+    strategy: str = "default"
 
 
 def _read_upload_limit_bytes() -> int:
@@ -74,6 +84,15 @@ def _safe_float(value: object) -> float | None:
         if value is None:
             return None
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: object) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
     except (TypeError, ValueError):
         return None
 
@@ -203,15 +222,25 @@ def _get_media_duration_seconds(file_path: Path) -> float | None:
     return _safe_float((probe_data or {}).get("duration_seconds"))
 
 
+def _calculate_mp3_target_bitrate_kbps(duration_seconds: float | None) -> int:
+    if not duration_seconds or duration_seconds <= 0:
+        return 320
+
+    target_bitrate_kbps = math.floor(
+        (TARGET_UPLOAD_BYTES * 8) / duration_seconds / 1000
+    )
+    return max(
+        MIN_MP3_BITRATE_KBPS,
+        min(320, target_bitrate_kbps),
+    )
+
+
 def _compress_mp3_to_fit(file_path: Path, duration_seconds: float) -> Path:
     ffmpeg_path = _get_ffmpeg_path()
     if duration_seconds <= 0:
         raise DownloadError("Could not determine audio duration for compression.")
 
-    target_bitrate_kbps = math.floor(
-        (TARGET_UPLOAD_BYTES * 8) / duration_seconds / 1000
-    )
-    max_bitrate_kbps = min(320, target_bitrate_kbps)
+    max_bitrate_kbps = _calculate_mp3_target_bitrate_kbps(duration_seconds)
     if max_bitrate_kbps < MIN_MP3_BITRATE_KBPS:
         raise DownloadError(
             "This audio is too long to fit within Telegram's upload limit."
@@ -431,9 +460,261 @@ def prepare_video_for_delivery(
     return _ensure_upload_size(normalized_file, "mp4", duration_seconds)
 
 
-def _build_options(format_choice: str, download_dir: Path) -> dict[str, object]:
+def _estimate_format_size_bytes(
+    format_info: dict[str, object], duration_seconds: float | None
+) -> int | None:
+    direct_size = _safe_int(format_info.get("filesize"))
+    if direct_size and direct_size > 0:
+        return direct_size
+
+    approx_size = _safe_int(format_info.get("filesize_approx"))
+    if approx_size and approx_size > 0:
+        return approx_size
+
+    total_bitrate_kbps = _safe_float(format_info.get("tbr"))
+    if duration_seconds and duration_seconds > 0 and total_bitrate_kbps:
+        estimated_bytes = duration_seconds * total_bitrate_kbps * 1000 / 8
+        return int(estimated_bytes)
+
+    return None
+
+
+def _is_mp4_compatible_codec_pair(
+    video_codec: str | None,
+    audio_codec: str | None,
+) -> bool:
+    normalized_video = (video_codec or "").lower()
+    normalized_audio = (audio_codec or "").lower()
+    video_ok = normalized_video in {"avc1", "h264"} or normalized_video.startswith(
+        ("avc1", "h264")
+    )
+    audio_ok = (
+        normalized_audio in {"", "aac", "mp4a.40.2"}
+        or normalized_audio.startswith("mp4a")
+    )
+    return video_ok and audio_ok
+
+
+def _is_mp4_compatible_audio_codec(audio_codec: str | None) -> bool:
+    normalized_audio = (audio_codec or "").lower()
+    return normalized_audio in {"", "aac", "mp4a.40.2"} or normalized_audio.startswith(
+        "mp4a"
+    )
+
+
+def _candidate_quality_score(
+    height: int | None,
+    fps: float | None,
+    total_bitrate_kbps: float | None,
+    compatibility_rank: int,
+) -> int:
+    safe_height = max(0, height or 0)
+    safe_fps = max(0, int((fps or 0) * 10))
+    safe_tbr = max(0, int(total_bitrate_kbps or 0))
+    return (
+        safe_height * 1_000_000
+        + safe_fps * 10_000
+        + safe_tbr * 10
+        + compatibility_rank * 500
+    )
+
+
+def _iter_media_formats(info: dict[str, object]) -> list[dict[str, object]]:
+    formats = info.get("formats") or []
+    if isinstance(formats, list):
+        return [item for item in formats if isinstance(item, dict)]
+    return []
+
+
+def _choose_mp3_download_plan(info: dict[str, object]) -> DownloadPlan:
+    duration_seconds = _safe_float(info.get("duration"))
+    bitrate_kbps = _calculate_mp3_target_bitrate_kbps(duration_seconds)
+    return DownloadPlan(
+        format_selector="bestaudio/best",
+        preferred_audio_quality_kbps=bitrate_kbps,
+        strategy="audio_budgeted_extract",
+    )
+
+
+def _choose_mp4_download_plan(info: dict[str, object]) -> DownloadPlan:
+    duration_seconds = _safe_float(info.get("duration"))
+    formats = _iter_media_formats(info)
+
+    best_plan: DownloadPlan | None = None
+    best_score: tuple[int, int, int] | None = None
+
+    progressive_formats: list[dict[str, object]] = []
+    video_only_formats: list[dict[str, object]] = []
+    audio_only_formats: list[dict[str, object]] = []
+
+    for media_format in formats:
+        format_id = str(media_format.get("format_id") or "").strip()
+        if not format_id:
+            continue
+
+        video_codec = str(media_format.get("vcodec") or "none").lower()
+        audio_codec = str(media_format.get("acodec") or "none").lower()
+
+        has_video = video_codec != "none"
+        has_audio = audio_codec != "none"
+
+        if has_video and has_audio:
+            progressive_formats.append(media_format)
+        elif has_video:
+            video_only_formats.append(media_format)
+        elif has_audio:
+            audio_only_formats.append(media_format)
+
+    for media_format in progressive_formats:
+        format_id = str(media_format.get("format_id"))
+        expected_size_bytes = _estimate_format_size_bytes(media_format, duration_seconds)
+        compatibility_rank = 3
+        if (
+            str(media_format.get("ext") or "").lower() == "mp4"
+            and _is_mp4_compatible_codec_pair(
+                str(media_format.get("vcodec") or ""),
+                str(media_format.get("acodec") or ""),
+            )
+        ):
+            compatibility_rank = 4
+
+        quality_score = _candidate_quality_score(
+            _safe_int(media_format.get("height")),
+            _safe_float(media_format.get("fps")),
+            _safe_float(media_format.get("tbr")),
+            compatibility_rank,
+        )
+        size_rank = (
+            2
+            if expected_size_bytes is not None and expected_size_bytes <= TARGET_UPLOAD_BYTES
+            else 1
+            if expected_size_bytes is None
+            else 0
+        )
+        closeness_score = (
+            -abs(TARGET_UPLOAD_BYTES - expected_size_bytes)
+            if expected_size_bytes is not None
+            else -10**18
+        )
+        plan = DownloadPlan(
+            format_selector=format_id,
+            expected_size_bytes=expected_size_bytes,
+            strategy="progressive_direct",
+        )
+        score = (size_rank, quality_score, closeness_score)
+        if best_score is None or score > best_score:
+            best_plan = plan
+            best_score = score
+
+    ranked_videos = sorted(
+        video_only_formats,
+        key=lambda media_format: _candidate_quality_score(
+            _safe_int(media_format.get("height")),
+            _safe_float(media_format.get("fps")),
+            _safe_float(media_format.get("tbr")),
+            0,
+        ),
+        reverse=True,
+    )[:12]
+    ranked_audios = sorted(
+        audio_only_formats,
+        key=lambda media_format: (
+            _safe_float(media_format.get("abr")) or 0,
+            _safe_float(media_format.get("tbr")) or 0,
+            1 if str(media_format.get("ext") or "").lower() in {"m4a", "mp4"} else 0,
+        ),
+        reverse=True,
+    )[:8]
+
+    for video_format in ranked_videos:
+        video_id = str(video_format.get("format_id") or "").strip()
+        video_size = _estimate_format_size_bytes(video_format, duration_seconds)
+        if not video_id:
+            continue
+
+        for audio_format in ranked_audios:
+            audio_id = str(audio_format.get("format_id") or "").strip()
+            audio_size = _estimate_format_size_bytes(audio_format, duration_seconds)
+            if not audio_id:
+                continue
+
+            expected_size_bytes: int | None = None
+            if video_size is not None and audio_size is not None:
+                expected_size_bytes = video_size + audio_size
+
+            compatibility_rank = 1
+            merge_output_format = "mkv"
+            if (
+                str(video_format.get("ext") or "").lower() == "mp4"
+                and str(audio_format.get("ext") or "").lower() in {"m4a", "mp4"}
+                and _is_mp4_compatible_codec_pair(
+                    str(video_format.get("vcodec") or ""),
+                    str(audio_format.get("acodec") or ""),
+                )
+                and _is_mp4_compatible_audio_codec(str(audio_format.get("acodec") or ""))
+            ):
+                compatibility_rank = 3
+                merge_output_format = "mp4"
+
+            total_bitrate_kbps = (
+                (_safe_float(video_format.get("tbr")) or 0)
+                + (_safe_float(audio_format.get("tbr")) or 0)
+            )
+            quality_score = _candidate_quality_score(
+                _safe_int(video_format.get("height")),
+                _safe_float(video_format.get("fps")),
+                total_bitrate_kbps,
+                compatibility_rank,
+            )
+            size_rank = (
+                2
+                if expected_size_bytes is not None and expected_size_bytes <= TARGET_UPLOAD_BYTES
+                else 1
+                if expected_size_bytes is None
+                else 0
+            )
+            closeness_score = (
+                -abs(TARGET_UPLOAD_BYTES - expected_size_bytes)
+                if expected_size_bytes is not None
+                else -10**18
+            )
+            plan = DownloadPlan(
+                format_selector=f"{video_id}+{audio_id}",
+                merge_output_format=merge_output_format,
+                expected_size_bytes=expected_size_bytes,
+                strategy="adaptive_merge",
+            )
+            score = (size_rank, quality_score, closeness_score)
+            if best_score is None or score > best_score:
+                best_plan = plan
+                best_score = score
+
+    if best_plan:
+        return best_plan
+
+    return DownloadPlan(
+        format_selector="bv*+ba/b",
+        merge_output_format="mkv",
+        strategy="fallback_best_available",
+    )
+
+
+def _choose_download_plan(info: dict[str, object], format_choice: str) -> DownloadPlan:
+    if format_choice == "mp3":
+        return _choose_mp3_download_plan(info)
+    if format_choice == "mp4":
+        return _choose_mp4_download_plan(info)
+    raise DownloadError("Only mp3 and mp4 are supported.")
+
+
+def _build_options(
+    format_choice: str,
+    download_dir: Path,
+    plan: DownloadPlan | None = None,
+) -> dict[str, object]:
     output_template = str(download_dir / "%(extractor)s_%(id)s_%(title).80s.%(ext)s")
     ffmpeg_path = _get_ffmpeg_path(required=format_choice in {"mp3", "mp4"})
+    plan = plan or DownloadPlan(format_selector="best")
     base_options = {
         "outtmpl": output_template,
         "quiet": True,
@@ -451,27 +732,44 @@ def _build_options(format_choice: str, download_dir: Path) -> dict[str, object]:
         "geo_bypass": True,
         "concurrent_fragment_downloads": 4,
         "ffmpeg_location": ffmpeg_path,
+        "format": plan.format_selector,
     }
 
     if format_choice == "mp3":
         return base_options | {
-            "format": "bestaudio/best",
             "postprocessors": [
                 {
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
-                    "preferredquality": "320",
+                    "preferredquality": str(plan.preferred_audio_quality_kbps or 320),
                 }
             ],
         }
 
     if format_choice == "mp4":
-        return base_options | {
-            "format": "bv*+ba/b",
-            "merge_output_format": "mkv",
-        }
+        video_options: dict[str, object] = {}
+        if plan.merge_output_format:
+            video_options["merge_output_format"] = plan.merge_output_format
+        return base_options | video_options
 
     raise DownloadError("Only mp3 and mp4 are supported.")
+
+
+def _extract_media_info(url: str) -> dict[str, object]:
+    with yt_dlp.YoutubeDL(
+        {
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "noplaylist": True,
+            "socket_timeout": 30,
+            "geo_bypass": True,
+        }
+    ) as ydl:
+        info = ydl.extract_info(url, download=False)
+        if not isinstance(info, dict):
+            raise DownloadError("Could not inspect the media before downloading.")
+        return info
 
 
 def _find_downloaded_file(downloaded_file: Path, format_choice: str) -> Path:
@@ -550,7 +848,10 @@ def download_media(url: str, format_choice: str) -> Path:
     job_dir = Path(tempfile.mkdtemp(prefix="job_", dir=DOWNLOAD_DIR))
 
     try:
-        with yt_dlp.YoutubeDL(_build_options(format_choice, job_dir)) as ydl:
+        info = _extract_media_info(url)
+        plan = _choose_download_plan(info, format_choice)
+
+        with yt_dlp.YoutubeDL(_build_options(format_choice, job_dir, plan)) as ydl:
             info = ydl.extract_info(url, download=True)
             downloaded_file = Path(ydl.prepare_filename(info))
             duration_seconds = _safe_float(info.get("duration"))
