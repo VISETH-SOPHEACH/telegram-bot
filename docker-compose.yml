@@ -1,0 +1,10 @@
+services:
+  telegram-bot:
+    build:
+      context: .
+    container_name: telegram-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/app/downloads

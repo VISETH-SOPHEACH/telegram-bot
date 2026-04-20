@@ -64,6 +64,28 @@ macOS or Linux:
 sh ./run_bot.sh
 ```
 
+## Docker
+
+Build and run with Docker Compose:
+
+```sh
+docker compose up -d --build
+```
+
+Stop it:
+
+```sh
+docker compose down
+```
+
+Notes:
+
+- `docker-compose.yml` reads `BOT_TOKEN` and optional `TELEGRAM_MAX_UPLOAD_MB` from `.env`.
+- The container installs system `ffmpeg`, so media processing works without extra setup.
+- `./downloads` is mounted into the container so temporary media files stay in the project folder.
+- This bot uses polling, so no port mapping is needed.
+- The image only copies `bot.py`, `downloader.py`, and `requirements.txt` to keep the build smaller.
+
 ## Windows background startup
 
 Install the login-time auto-start task:

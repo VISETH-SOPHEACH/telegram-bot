@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -95,8 +96,13 @@ def _get_pending_requests(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> dict[str, str]:
     pending_requests = context.user_data.setdefault(PENDING_REQUESTS_KEY, {})
-    if not isinstance(pending_requests, dict):
-        pending_requests = {}
+    if isinstance(pending_requests, OrderedDict):
+        return pending_requests
+    if isinstance(pending_requests, dict):
+        pending_requests = OrderedDict(pending_requests.items())
+        context.user_data[PENDING_REQUESTS_KEY] = pending_requests
+    else:
+        pending_requests = OrderedDict()
         context.user_data[PENDING_REQUESTS_KEY] = pending_requests
     return pending_requests
 
@@ -147,8 +153,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     pending_requests[request_id] = url
 
     while len(pending_requests) > 10:
-        oldest_request_id = next(iter(pending_requests))
-        pending_requests.pop(oldest_request_id, None)
+        pending_requests.popitem(last=False)
 
     await update.message.reply_text(
         "Link received. Choose your download format:",

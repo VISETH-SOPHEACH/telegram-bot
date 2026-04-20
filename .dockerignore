@@ -1,0 +1,13 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.ps1
+*.sh
+*.vbs
+downloads
+.env
+README.md

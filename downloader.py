@@ -15,6 +15,9 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MIN_MP3_BITRATE_KBPS = 32
 DEFAULT_AUDIO_BITRATE_KBPS = 128
 FFMPEG_VIDEO_SCALE_FILTER = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+MIN_MP4_AUDIO_BITRATE_KBPS = 64
+MIN_MP4_VIDEO_BITRATE_KBPS = 120
+MP4_CONTAINER_OVERHEAD_KBPS = 32
 _FFMPEG_PATH: str | None = None
 
 
@@ -48,7 +51,7 @@ def _get_ffmpeg_path(required: bool = True) -> str | None:
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
         try:
-            import imageio_ffmpeg
+            import imageio_ffmpeg  # type: ignore
         except ImportError:
             ffmpeg_path = None
         else:
@@ -104,6 +107,14 @@ def _run_command(command: list[str], error_message: str) -> None:
     raise DownloadError(error_message)
 
 
+def _replace_if_better_candidate(
+    best_candidate: Path | None, candidate: Path
+) -> Path:
+    if best_candidate and best_candidate.exists() and best_candidate != candidate:
+        best_candidate.unlink(missing_ok=True)
+    return candidate
+
+
 def _probe_media(file_path: Path) -> dict[str, object] | None:
     ffmpeg_path = _get_ffmpeg_path(required=False)
     if not ffmpeg_path:
@@ -129,7 +140,7 @@ def _probe_media(file_path: Path) -> dict[str, object] | None:
         stripped = line.strip()
 
         if stripped.startswith("Input #0, "):
-            format_name = stripped[len("Input #0, "):].rsplit(", from", 1)[0].strip()
+            format_name = stripped[len("Input #0, ") :].rsplit(", from", 1)[0].strip()
 
         if "Duration:" in stripped and duration_seconds is None:
             match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stripped)
@@ -200,35 +211,58 @@ def _compress_mp3_to_fit(file_path: Path, duration_seconds: float) -> Path:
     target_bitrate_kbps = math.floor(
         (TARGET_UPLOAD_BYTES * 8) / duration_seconds / 1000
     )
-    target_bitrate_kbps = min(320, target_bitrate_kbps)
-    if target_bitrate_kbps < MIN_MP3_BITRATE_KBPS:
+    max_bitrate_kbps = min(320, target_bitrate_kbps)
+    if max_bitrate_kbps < MIN_MP3_BITRATE_KBPS:
         raise DownloadError(
             "This audio is too long to fit within Telegram's upload limit."
         )
 
-    compressed_path = file_path.with_name(f"{file_path.stem}.tg.mp3")
-    command = [
-        ffmpeg_path,
-        "-y",
-        "-i",
-        str(file_path),
-        "-vn",
-        "-c:a",
-        "libmp3lame",
-        "-b:a",
-        f"{target_bitrate_kbps}k",
-        str(compressed_path),
-    ]
+    best_candidate: Path | None = None
+    low = MIN_MP3_BITRATE_KBPS
+    high = max_bitrate_kbps
 
-    _run_command(command, "ffmpeg could not compress the MP3 for Telegram delivery.")
+    while low <= high:
+        bitrate_kbps = (low + high) // 2
+        candidate_path = file_path.with_name(
+            f"{file_path.stem}.tg.{bitrate_kbps}k.mp3"
+        )
+        candidate_path.unlink(missing_ok=True)
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            str(file_path),
+            "-vn",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            f"{bitrate_kbps}k",
+            str(candidate_path),
+        ]
 
-    if compressed_path.stat().st_size > TELEGRAM_UPLOAD_LIMIT_BYTES:
-        compressed_path.unlink(missing_ok=True)
+        _run_command(command, "ffmpeg could not compress the MP3 for Telegram delivery.")
+
+        if candidate_path.stat().st_size <= TELEGRAM_UPLOAD_LIMIT_BYTES:
+            best_candidate = _replace_if_better_candidate(best_candidate, candidate_path)
+            low = bitrate_kbps + 1
+        else:
+            candidate_path.unlink(missing_ok=True)
+            high = bitrate_kbps - 1
+
+    if not best_candidate:
         raise DownloadError(
             "The audio is still too large for Telegram after compression."
         )
 
-    return _replace_file(file_path, compressed_path)
+    return _replace_file(file_path, best_candidate)
+
+
+def _split_mp4_bitrates(total_bitrate_kbps: int) -> tuple[int, int]:
+    audio_bitrate_kbps = min(
+        DEFAULT_AUDIO_BITRATE_KBPS, max(MIN_MP4_AUDIO_BITRATE_KBPS, total_bitrate_kbps // 5)
+    )
+    video_bitrate_kbps = total_bitrate_kbps - audio_bitrate_kbps - MP4_CONTAINER_OVERHEAD_KBPS
+    return video_bitrate_kbps, audio_bitrate_kbps
 
 
 def _compress_mp4_to_fit(file_path: Path, duration_seconds: float) -> Path:
@@ -236,55 +270,75 @@ def _compress_mp4_to_fit(file_path: Path, duration_seconds: float) -> Path:
     if duration_seconds <= 0:
         raise DownloadError("Could not determine video duration for compression.")
 
-    total_bitrate_kbps = math.floor(
+    max_total_bitrate_kbps = math.floor(
         (TARGET_UPLOAD_BYTES * 8) / duration_seconds / 1000
     )
-    audio_bitrate_kbps = min(DEFAULT_AUDIO_BITRATE_KBPS, max(64, total_bitrate_kbps // 5))
-    video_bitrate_kbps = total_bitrate_kbps - audio_bitrate_kbps - 32
-
-    if video_bitrate_kbps < 120:
+    min_total_bitrate_kbps = (
+        MIN_MP4_VIDEO_BITRATE_KBPS
+        + MIN_MP4_AUDIO_BITRATE_KBPS
+        + MP4_CONTAINER_OVERHEAD_KBPS
+    )
+    if max_total_bitrate_kbps < min_total_bitrate_kbps:
         raise DownloadError(
             "This video is too long to fit within Telegram's upload limit."
         )
 
-    compressed_path = file_path.with_name(f"{file_path.stem}.tg.mp4")
-    command = [
-        ffmpeg_path,
-        "-y",
-        "-i",
-        str(file_path),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-vf",
-        FFMPEG_VIDEO_SCALE_FILTER,
-        "-pix_fmt",
-        "yuv420p",
-        "-b:v",
-        f"{video_bitrate_kbps}k",
-        "-maxrate",
-        f"{video_bitrate_kbps}k",
-        "-bufsize",
-        f"{video_bitrate_kbps * 2}k",
-        "-c:a",
-        "aac",
-        "-b:a",
-        f"{audio_bitrate_kbps}k",
-        "-movflags",
-        "+faststart",
-        str(compressed_path),
-    ]
+    best_candidate: Path | None = None
+    low = min_total_bitrate_kbps
+    high = max_total_bitrate_kbps
 
-    _run_command(command, "ffmpeg could not compress the video for Telegram delivery.")
+    while low <= high:
+        total_bitrate_kbps = (low + high) // 2
+        video_bitrate_kbps, audio_bitrate_kbps = _split_mp4_bitrates(
+            total_bitrate_kbps
+        )
+        candidate_path = file_path.with_name(
+            f"{file_path.stem}.tg.{total_bitrate_kbps}k.mp4"
+        )
+        candidate_path.unlink(missing_ok=True)
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            str(file_path),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-vf",
+            FFMPEG_VIDEO_SCALE_FILTER,
+            "-pix_fmt",
+            "yuv420p",
+            "-b:v",
+            f"{video_bitrate_kbps}k",
+            "-maxrate",
+            f"{video_bitrate_kbps}k",
+            "-bufsize",
+            f"{video_bitrate_kbps * 2}k",
+            "-c:a",
+            "aac",
+            "-b:a",
+            f"{audio_bitrate_kbps}k",
+            "-movflags",
+            "+faststart",
+            str(candidate_path),
+        ]
 
-    if compressed_path.stat().st_size > TELEGRAM_UPLOAD_LIMIT_BYTES:
-        compressed_path.unlink(missing_ok=True)
+        _run_command(command, "ffmpeg could not compress the video for Telegram delivery.")
+
+        if candidate_path.stat().st_size <= TELEGRAM_UPLOAD_LIMIT_BYTES:
+            best_candidate = _replace_if_better_candidate(best_candidate, candidate_path)
+            low = total_bitrate_kbps + 1
+        else:
+            candidate_path.unlink(missing_ok=True)
+            high = total_bitrate_kbps - 1
+
+    if not best_candidate:
         raise DownloadError(
             "The video is still too large for Telegram after compression."
         )
 
-    return _replace_file(file_path, compressed_path)
+    return _replace_file(file_path, best_candidate)
 
 
 def _ensure_upload_size(
@@ -402,11 +456,13 @@ def _build_options(format_choice: str, download_dir: Path) -> dict[str, object]:
     if format_choice == "mp3":
         return base_options | {
             "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "320",
-            }],
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "320",
+                }
+            ],
         }
 
     if format_choice == "mp4":
@@ -424,29 +480,33 @@ def _find_downloaded_file(downloaded_file: Path, format_choice: str) -> Path:
     if format_choice == "mp3":
         candidates.append(downloaded_file.with_suffix(".mp3"))
     elif format_choice == "mp4":
-        candidates.extend([
-            downloaded_file.with_suffix(".mkv"),
-            downloaded_file.with_suffix(".mp4"),
-            downloaded_file.with_suffix(".webm"),
-        ])
+        candidates.extend(
+            [
+                downloaded_file.with_suffix(".mkv"),
+                downloaded_file.with_suffix(".mp4"),
+                downloaded_file.with_suffix(".webm"),
+            ]
+        )
 
     for candidate in candidates:
         if candidate.exists() and candidate.is_file():
             return candidate
 
-    matches = sorted(
-        (
-            path
-            for path in downloaded_file.parent.iterdir()
-            if path.is_file() and path.suffix not in {".part", ".ytdl"}
-        ),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    if matches:
-        return matches[0]
+    most_recent_match: Path | None = None
+    most_recent_mtime = float("-inf")
+    for path in downloaded_file.parent.iterdir():
+        if not path.is_file() or path.suffix in {".part", ".ytdl"}:
+            continue
+        mtime = path.stat().st_mtime
+        if mtime > most_recent_mtime:
+            most_recent_match = path
+            most_recent_mtime = mtime
+    if most_recent_match:
+        return most_recent_match
 
-    raise DownloadError("The media was downloaded, but the final file could not be found.")
+    raise DownloadError(
+        "The media was downloaded, but the final file could not be found."
+    )
 
 
 def _resolve_downloaded_path(
