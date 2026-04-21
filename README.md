@@ -87,6 +87,43 @@ Notes:
 - This bot uses polling, so no port mapping is needed.
 - The image only copies `bot.py`, `downloader.py`, and `requirements.txt` to keep the build smaller.
 
+## Linux server with systemd
+
+If you want the bot to keep working while your own PC is off, run it on an always-on Linux server such as an Ubuntu VPS.
+
+Example setup for Ubuntu:
+
+```sh
+sudo apt update
+sudo apt install -y python3 python3-venv ffmpeg git
+sudo useradd --system --create-home --home-dir /opt/telegram-bot --shell /usr/sbin/nologin telegrambot
+sudo git clone <your-repo-url> /opt/telegram-bot
+sudo chown -R telegrambot:telegrambot /opt/telegram-bot
+cd /opt/telegram-bot
+sudo -u telegrambot cp .env.example .env
+sudo -u telegrambot nano .env
+sudo -u telegrambot sh ./setup_bot.sh
+sudo cp ./telegram-bot.service /etc/systemd/system/telegram-bot.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now telegram-bot
+sudo systemctl status telegram-bot
+```
+
+Useful service commands:
+
+```sh
+sudo systemctl restart telegram-bot
+sudo systemctl stop telegram-bot
+sudo journalctl -u telegram-bot -f
+```
+
+Notes:
+
+- The included [telegram-bot.service](/d:/telegram-bot/telegram-bot.service) expects the bot to live in `/opt/telegram-bot`.
+- It runs as a dedicated `telegrambot` system user.
+- It uses the local virtual environment at `/opt/telegram-bot/.venv`.
+- If you use a different path or username, edit the service file before copying it to `/etc/systemd/system/`.
+
 ## Windows background startup
 
 Install the login-time auto-start task:

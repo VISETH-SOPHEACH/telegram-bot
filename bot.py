@@ -187,9 +187,12 @@ async def handle_format_choice(
         await query.edit_message_text("This request expired. Please send the link again.")
         return
 
-    await query.edit_message_text(
-        f"Downloading {format_choice.upper()} in the highest available quality. Please wait..."
+    progress_text = (
+        "Downloading audio and converting it to MP3. Please wait..."
+        if format_choice == "mp3"
+        else "Inspecting available video formats and downloading the best option for Telegram. Please wait..."
     )
+    await query.edit_message_text(progress_text)
 
     file_path: Path | None = None
     chat_id = query.message.chat.id

@@ -848,8 +848,14 @@ def download_media(url: str, format_choice: str) -> Path:
     job_dir = Path(tempfile.mkdtemp(prefix="job_", dir=DOWNLOAD_DIR))
 
     try:
-        info = _extract_media_info(url)
-        plan = _choose_download_plan(info, format_choice)
+        if format_choice == "mp3":
+            plan = DownloadPlan(
+                format_selector="bestaudio/best",
+                strategy="direct_audio_download",
+            )
+        else:
+            info = _extract_media_info(url)
+            plan = _choose_download_plan(info, format_choice)
 
         with yt_dlp.YoutubeDL(_build_options(format_choice, job_dir, plan)) as ydl:
             info = ydl.extract_info(url, download=True)
